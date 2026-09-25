@@ -145,9 +145,9 @@ func main() {
 
 	dbHost := getEnv("DB_HOST", "postgres")
 	dbPort := getEnv("DB_PORT", "5432")
-	dbUser := getEnv("DB_USER", "foodonmood_admin")
-	dbPass := getEnv("DB_PASSWORD", "secretpassword")
-	dbName := getEnv("DB_NAME", "foodonmood_core")
+	dbUser := getEnv("DB_USER", "fom_admin")
+	dbPass := getEnv("DB_PASSWORD", "password")
+	dbName := getEnv("DB_NAME", "fom_core")
 
 	redisHost := getEnv("REDIS_HOST", "redis")
 	redisPort := getEnv("REDIS_PORT", "6379")
@@ -576,9 +576,9 @@ services:
     image: postgres:16-alpine
     container_name: foodonmood-db
     environment:
-      POSTGRES_USER: foodonmood_admin
-      POSTGRES_PASSWORD: secretpassword
-      POSTGRES_DB: foodonmood_core
+      POSTGRES_USER: fom_admin
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: fom_core
     ports:
       - "5433:5432"
     volumes:
@@ -607,9 +607,9 @@ services:
     environment:
       DB_HOST: postgres
       DB_PORT: 5432
-      DB_USER: foodonmood_admin
-      DB_PASSWORD: secretpassword
-      DB_NAME: foodonmood_core
+      DB_USER: fom_admin
+      DB_PASSWORD: password
+      DB_NAME: fom_core
       REDIS_HOST: redis
       REDIS_PORT: 6379
     ports:
