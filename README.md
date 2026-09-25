@@ -214,16 +214,5 @@ We welcome contributions to this project! Here are a few guidelines to follow:
     21. Ani R, Augustine A, Akhil N.C. and Deepa O.S., 2016. “Random Forest Ensemble Classifier to Predict the Coronary Heart Disease Using Risk Factors”, In Proceedings of the International Conference on Soft Computing Systems (pp. 701-710). Springer, New Delhi.
 
 
-## Maintainers
-
-- [X] [PS Narayanan](https://github.com/PSNAppz) - Co-owner
-- [X] [KingAkeem](https://github.com/KingAkeem) - Co-owner
-
-## All Thanks to Our Contributors
-
-<a href="https://github.com/DedSecInside/TorBot/graphs/contributors">
-  <img src="https://contrib.rocks/image?repo=DedSecInside/TorBot" />
-</a>
-
 ## License
 [GNU Public License](https://github.com/DedSecInside/TorBot/blob/dev/LICENSE.md)
