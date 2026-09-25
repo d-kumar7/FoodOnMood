@@ -1,0 +1,72 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: foodonmood-db
+    environment:
+      POSTGRES_USER: foodonmood_admin
+      POSTGRES_PASSWORD: secretpassword
+      POSTGRES_DB: foodonmood_core
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./infrastructure/docker/schema.sql:/docker-entrypoint-initdb.d/schema.sql
+    networks:
+      - foodonmood_net
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: foodonmood-cache
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - foodonmood_net
+    restart: unless-stopped
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: foodonmood-api
+    environment:
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_USER: foodonmood_admin
+      DB_PASSWORD: secretpassword
+      DB_NAME: foodonmood_core
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+    ports:
+      - "8080:8080"
+    depends_on:
+      - postgres
+      - redis
+    networks:
+      - foodonmood_net
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: foodonmood-ui
+    environment:
+      INTERNAL_API_URL: http://backend:8080
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend
+    networks:
+      - foodonmood_net
+    restart: unless-stopped
+
+networks:
+  foodonmood_net:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  redis_data:
