@@ -1,33 +1,5 @@
+# FoodOnMood - Your Mood Our Food
 
-
-
-# Install Docker on Ubuntu
-```bash
-curl -fsSL https://get.docker.com -o get-docker.sh
-sudo sh get-docker.sh
-Executing docker install script, commit: 7cae5f8b0decc17d6571f9f52eb840fbc13b2737
-<...>
-```
-
-# Phase - I
-<P>frontend # Tier 1: Next.js web application
-backend/cmd/api # Tier 2: Go microservices entrypoint
-backend/internal # Tier 2: Go Clean Architecture domains
-infrastructure/docker # Tier 3: Local container orchestration
-infrastructure/aws # Cloud IaC (Terraform/CloudFormation)
-scripts # Automation and deployment bash scripts
-</P>
-
-<h3>  Scaffold the 3-tier architecture directories </h3>
-
-```bash
-mkdir foodonmood
-cd foodonmood
-mkdir -p {frontend,backend/cmd/api,backend/internal,infrastructure/docker,infrastructure/aws,scripts}
-git init
-cat << 'EOF' > README.md
-# foodonmood - For All Visitors
-## Enterprise E-Commerce Architecture
 ### Directory Structure Overview
 - **frontend/**: Tier 1 - Next.js web application
 - **backend/cmd/api/**: Tier 2 - Go microservices entrypoint
@@ -39,7 +11,23 @@ cat << 'EOF' > README.md
 The `docker-compose.yml` file simulates the AWS data layer:
 1. **PostgreSQL 16**: Primary relational database simulating AWS RDS for users, products, and orders.
 2. **Redis 7**: In-memory cache simulating AWS ElastiCache for high-speed shopping cart state.
-EOF
+
+# Install Docker on Ubuntu
+```bash
+curl -fsSL https://get.docker.com -o get-docker.sh
+sudo sh get-docker.sh
+Executing docker install script, commit: 7cae5f8b0decc17d6571f9f52eb840fbc13b2737
+<...>
+```
+
+# Phase - I
+
+<h3> Scaffold the 3-tier architecture directories </h3>
+
+```bash
+mkdir foodonmood
+cd foodonmood
+mkdir -p {frontend,backend/cmd/api,backend/internal,infrastructure/docker,infrastructure/aws,scripts}
 cat << 'EOF' > infrastructure/docker/docker-compose.yml
 version: '3.8'
 services:
