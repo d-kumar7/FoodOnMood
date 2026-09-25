@@ -20,51 +20,53 @@ Executing docker install script, commit: 7cae5f8b0decc17d6571f9f52eb840fbc13b273
 <...>
 ```
 
-# Phase - I
-
 <h3> Scaffold the 3-tier architecture directories </h3>
 
 ```bash
-mkdir foodonmood
-cd foodonmood
+mkdir -p /app/foodonmood && cd /app/foodonmood
+
 mkdir -p {frontend,backend/cmd/api,backend/internal,infrastructure/docker,infrastructure/aws,scripts}
+
 cat << 'EOF' > infrastructure/docker/docker-compose.yml
 version: '3.8'
+
 services:
- postgres:
- image: postgres:16-alpine
- container_name: foodonmood-db
- environment:
- POSTGRES_USER: foodonmood_admin
- POSTGRES_PASSWORD: secretpassword
- POSTGRES_DB: foodonmood_core
- ports:
- - "5432:5432"
- volumes:
- - postgres_data:/var/lib/postgresql/data
- networks:
- - foodonmood_network
- restart: unless-stopped
- redis:
- image: redis:7-alpine
- container_name: foodonmood-cache
- ports:
- - "6379:6379"
- volumes:
- - redis_data:/data
- networks:
- - foodonmood_network
- restart: unless-stopped
+  postgres:
+    image: postgres:16-alpine
+    container_name: foodonmood-db
+    environment:
+      POSTGRES_USER: foodonmood_admin
+      POSTGRES_PASSWORD: secretpassword
+      POSTGRES_DB: foodonmood_core
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - foodonmood_network
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: foodonmood-cache
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - foodonmood_network
+    restart: unless-stopped
+
 volumes:
- postgres_data:
- redis_data:
+  postgres_data:
+  redis_data:
+
 networks:
- foodonmood_network:
- driver: bridge
+  foodonmood_network:
+    driver: bridge
 EOF
-cd infrastructure/docker
-docker compose up -d
-cd ../..
+
+cd infrastructure/docker && docker compose up -d
 ```
 
 # To build the Tier 2 Application layer so it can establish a connection to your PostgreSQL and Redis containers.
