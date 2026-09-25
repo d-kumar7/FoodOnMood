@@ -93,11 +93,11 @@ Make sure your environment meets the following requirements:
    ```
 Give execution permissions to the automated installer:
 ```Bash
-chmod +x FoodOnMood
+chmod +x foodonmood/FoodOnMood.sh
 ```
 Run the orchestration script:
 ```Bash
-./FoodOnMood
+foodonmood/FoodOnMood.sh
 ```
 ```
 📡 Core API EndpointsMethodEndpointDescriptionSample Payload / OutputGET/API Status & Base Check{"service": "foodonmood backend API", "status": "online"}GET/healthLiveness / Readiness Probefoodonmood enterprise API is highly availableGET/productsFetch Product Catalog[{"sku": "MEAL-001", "name": "Spicy Paneer Tikka", "price_cents": 3500}]GET/cartGet Active User Session Cart{"MEAL-001": "2", "MEAL-002": "1"}POST/cartIncrement Item Quantity{"product_id": "MEAL-001", "quantity": 1}POST/checkoutProcess Order & Clear Cart{"status": "success", "message": "Order placed successfully!"}🔍 Verification & Health InspectionVerify service states directly from your shell:
