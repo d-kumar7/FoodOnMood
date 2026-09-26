@@ -89,7 +89,7 @@ Make sure your environment meets the following requirements:
 
 1. Clone the repository and navigate into the target workspace:
    ```bash
-   git clone [https://github.com/d-kumar7/foodonmood.git](https://github.com/d-kumar7/foodonmood.git)
+   git clone https://github.com/d-kumar7/foodonmood.git
    ```
 Give execution permissions to the automated installer:
 ```Bash
