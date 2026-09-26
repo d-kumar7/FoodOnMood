@@ -1,0 +1,691 @@
+cat << 'EOF' > FoodOnMood.sh
+#!/usr/bin/env bash
+set -e
+
+echo "=================================================="
+echo "🚀 1. FIX SYSTEM TIME & INSTALL DEPENDENCIES"
+echo "=================================================="
+
+# Fix SSL certificate/clock drift issues
+sudo apt-get update -y
+sudo apt-get install -y systemd-timesyncd curl git build-essential ca-certificates gnupg lsb-release
+sudo timedatectl set-ntp true || sudo hwclock -s || true
+
+# Install Docker if not present
+if ! command -v docker &> /dev/null; then
+  echo "📦 Installing Docker..."
+  sudo install -m 0755 -d /etc/apt/keyrings
+  curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+  sudo chmod a+r /etc/apt/keyrings/docker.gpg
+
+  echo \
+    "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu \
+    $(lsb_release -cs) stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+
+  sudo apt-get update -y
+  sudo apt-get install -y docker-ce docker-ce-cli containerd.io
+  sudo systemctl enable docker
+  sudo systemctl start docker
+  sudo usermod -aG docker "$USER" || true
+fi
+
+# Install Docker Compose Plugin manually if missing
+if ! docker compose version &> /dev/null; then
+  echo "📦 Installing Docker Compose CLI Plugin..."
+  mkdir -p ~/.docker/cli-plugins
+  curl -SL https://github.com/docker/compose/releases/latest/download/docker-compose-linux-x86_64 -o ~/.docker/cli-plugins/docker-compose
+  chmod +x ~/.docker/cli-plugins/docker-compose
+fi
+
+echo "=================================================="
+echo "📂 2. SCAFFOLDING DIRECTORY STRUCTURE & FILES"
+echo "=================================================="
+
+rm -rf foodonmood
+mkdir -p foodonmood/{frontend/src/app,backend/cmd/api,infrastructure/docker}
+cd foodonmood
+
+# --- Database Schema ---
+cat << 'SCHEMA' > infrastructure/docker/schema.sql
+CREATE EXTENSION IF NOT EXISTS pgcrypto;
+
+-- Users Table (Phone Authentication)
+CREATE TABLE IF NOT EXISTS users (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    phone_number VARCHAR(20) UNIQUE NOT NULL,
+    role VARCHAR(20) NOT NULL DEFAULT 'CUSTOMER',
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Products Table
+CREATE TABLE IF NOT EXISTS products (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    sku VARCHAR(50) UNIQUE NOT NULL,
+    name VARCHAR(255) NOT NULL,
+    description TEXT,
+    price_cents INT NOT NULL,
+    unit VARCHAR(50) DEFAULT 'portion',
+    estimated_delivery_time INT DEFAULT 30,
+    stock_quantity INT NOT NULL DEFAULT 0,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Orders Table
+CREATE TABLE IF NOT EXISTS orders (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id UUID REFERENCES users(id),
+    status VARCHAR(50) DEFAULT 'PREPARING',
+    delivery_lat DOUBLE PRECISION DEFAULT 28.4595,
+    delivery_lng DOUBLE PRECISION DEFAULT 77.0266,
+    driver_lat DOUBLE PRECISION DEFAULT 28.4500,
+    driver_lng DOUBLE PRECISION DEFAULT 77.0200,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Insert Default Admin & Sample Products
+INSERT INTO users (phone_number, role)
+VALUES ('+1234567890', 'ADMIN')
+ON CONFLICT (phone_number) DO NOTHING;
+
+INSERT INTO products (sku, name, description, price_cents, unit, estimated_delivery_time, stock_quantity)
+VALUES 
+    ('MEAL-001', 'Spicy Paneer Tikka', 'Classic paneer with spices', 3500, 'portion', 25, 50),
+    ('MEAL-002', 'Butter Chicken', 'Tender chicken and garlic naan', 4500, 'plate', 30, 30),
+    ('MEAL-003', 'Vegan Buddha Bowl', 'Quinoa, tofu, and greens', 2990, 'portion', 20, 20)
+ON CONFLICT (sku) DO NOTHING;
+SCHEMA
+
+# --- Go Backend ---
+cat << 'GOMOD' > backend/go.mod
+module foodonmood-backend
+
+go 1.22
+
+require (
+	github.com/go-chi/chi/v5 v5.0.12
+	github.com/go-chi/cors v1.2.1
+	github.com/golang-jwt/jwt/v5 v5.2.1
+	github.com/gorilla/websocket v1.5.1
+	github.com/jackc/pgx/v5 v5.5.5
+	github.com/redis/go-redis/v9 v9.5.1
+	github.com/twilio/twilio-go v1.20.1
+)
+GOMOD
+
+cat << 'GOMAIN' > backend/cmd/api/main.go
+package main
+
+import (
+	"context"
+	"crypto/rand"
+	"encoding/json"
+	"fmt"
+	"log"
+	"math/big"
+	"net/http"
+	"os"
+	"time"
+
+	"github.com/go-chi/chi/v5"
+	"github.com/go-chi/chi/v5/middleware"
+	"github.com/go-chi/cors"
+	"github.com/golang-jwt/jwt/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/redis/go-redis/v9"
+	"github.com/twilio/twilio-go"
+	openapi "github.com/twilio/twilio-go/rest/api/v2010"
+)
+
+type Product struct {
+	ID                    string `json:"id"`
+	SKU                   string `json:"sku"`
+	Name                  string `json:"name"`
+	Description           string `json:"description"`
+	PriceCents            int    `json:"price_cents"`
+	Unit                  string `json:"unit"`
+	EstimatedDeliveryTime int    `json:"estimated_delivery_time"`
+	StockQuantity         int    `json:"stock_quantity"`
+}
+
+type AuthRequest struct {
+	PhoneNumber string `json:"phone_number"`
+	OTP         string `json:"otp"`
+}
+
+type CartItem struct {
+	ProductID string `json:"product_id"`
+	Quantity  int    `json:"quantity"`
+}
+
+var jwtKey = []byte("super_secret_jwt_key")
+
+func getEnv(key, fallback string) string {
+	if val, ok := os.LookupEnv(key); ok {
+		return val
+	}
+	return fallback
+}
+
+func generateOTP() string {
+	n, err := rand.Int(rand.Reader, big.NewInt(900000))
+	if err != nil {
+		return "123456"
+	}
+	return fmt.Sprintf("%06d", n.Int64()+100000)
+}
+
+func sendTwilioSMS(toPhone, otpCode string) error {
+	accountSid := os.Getenv("TWILIO_ACCOUNT_SID")
+	authToken := os.Getenv("TWILIO_AUTH_TOKEN")
+	fromPhone := os.Getenv("TWILIO_PHONE_NUMBER")
+
+	if accountSid == "" || authToken == "" || fromPhone == "" {
+		return fmt.Errorf("Twilio credentials not configured")
+	}
+
+	client := twilio.NewRestClientWithParams(twilio.ClientParams{
+		Username: accountSid,
+		Password: authToken,
+	})
+
+	params := &openapi.CreateMessageParams{}
+	params.SetTo(toPhone)
+	params.SetFrom(fromPhone)
+	params.SetBody(fmt.Sprintf("Your foodonmood code is: %s", otpCode))
+
+	_, err := client.Api.CreateMessage(params)
+	return err
+}
+
+func main() {
+	ctx := context.Background()
+
+	dbHost := getEnv("DB_HOST", "postgres")
+	dbPort := getEnv("DB_PORT", "5432")
+	dbUser := getEnv("DB_USER", "fom_admin")
+	dbPass := getEnv("DB_PASSWORD", "password")
+	dbName := getEnv("DB_NAME", "fom_core")
+
+	redisHost := getEnv("REDIS_HOST", "redis")
+	redisPort := getEnv("REDIS_PORT", "6379")
+
+	dbURL := fmt.Sprintf("postgres://%s:%s@%s:%s/%s", dbUser, dbPass, dbHost, dbPort, dbName)
+
+	var dbPool *pgxpool.Pool
+	var err error
+	for i := 0; i < 15; i++ {
+		dbPool, err = pgxpool.New(ctx, dbURL)
+		if err == nil {
+			if err = dbPool.Ping(ctx); err == nil {
+				log.Println("Connected to PostgreSQL!")
+				break
+			}
+		}
+		log.Println("Waiting for PostgreSQL...")
+		time.Sleep(2 * time.Second)
+	}
+
+	rdb := redis.NewClient(&redis.Options{
+		Addr: fmt.Sprintf("%s:%s", redisHost, redisPort),
+	})
+
+	r := chi.NewRouter()
+	r.Use(middleware.Logger)
+	r.Use(middleware.Recoverer)
+
+	r.Use(cors.Handler(cors.Options{
+		AllowedOrigins:   []string{"*"},
+		AllowedMethods:   []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
+		AllowedHeaders:   []string{"*"},
+		AllowCredentials: true,
+	}))
+
+	r.Get("/health", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("foodonmood API running"))
+	})
+
+	r.Post("/auth/send-otp", func(w http.ResponseWriter, r *http.Request) {
+		var req AuthRequest
+		json.NewDecoder(r.Body).Decode(&req)
+		otpCode := generateOTP()
+		if req.PhoneNumber == "+1234567890" {
+			otpCode = "123456"
+		}
+		rdb.Set(ctx, "otp:"+req.PhoneNumber, otpCode, 5*time.Minute)
+		if err := sendTwilioSMS(req.PhoneNumber, otpCode); err != nil {
+			log.Printf("Twilio delivery skipped/failed: %v. Stored OTP: %s", err, otpCode)
+		}
+		w.Write([]byte(`{"message": "OTP generated successfully"}`))
+	})
+
+	r.Post("/auth/verify-otp", func(w http.ResponseWriter, r *http.Request) {
+		var req AuthRequest
+		json.NewDecoder(r.Body).Decode(&req)
+		cachedOTP, _ := rdb.Get(ctx, "otp:"+req.PhoneNumber).Result()
+
+		if cachedOTP != req.OTP && req.OTP != "123456" {
+			http.Error(w, "Invalid OTP", http.StatusUnauthorized)
+			return
+		}
+
+		var userID, role string
+		err := dbPool.QueryRow(ctx, "SELECT id, role FROM users WHERE phone_number=$1", req.PhoneNumber).Scan(&userID, &role)
+		if err != nil {
+			err = dbPool.QueryRow(ctx, "INSERT INTO users (phone_number, role) VALUES ($1, 'CUSTOMER') RETURNING id, role", req.PhoneNumber).Scan(&userID, &role)
+		}
+
+		token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+			"user_id": userID,
+			"role":    role,
+			"exp":     time.Now().Add(24 * time.Hour).Unix(),
+		})
+		tokenString, _ := token.SignedString(jwtKey)
+
+		json.NewEncoder(w).Encode(map[string]string{
+			"token": tokenString,
+			"role":  role,
+		})
+	})
+
+	r.Get("/products", func(w http.ResponseWriter, r *http.Request) {
+		rows, err := dbPool.Query(r.Context(), "SELECT id, sku, name, description, price_cents, unit, estimated_delivery_time, stock_quantity FROM products")
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		defer rows.Close()
+
+		var products []Product
+		for rows.Next() {
+			var p Product
+			rows.Scan(&p.ID, &p.SKU, &p.Name, &p.Description, &p.PriceCents, &p.Unit, &p.EstimatedDeliveryTime, &p.StockQuantity)
+			products = append(products, p)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(products)
+	})
+
+	r.Post("/admin/products", func(w http.ResponseWriter, r *http.Request) {
+		var p Product
+		json.NewDecoder(r.Body).Decode(&p)
+		_, err := dbPool.Exec(r.Context(), "INSERT INTO products (sku, name, description, price_cents, unit, estimated_delivery_time, stock_quantity) VALUES ($1,$2,$3,$4,$5,$6,$7)",
+			p.SKU, p.Name, p.Description, p.PriceCents, p.Unit, p.EstimatedDeliveryTime, p.StockQuantity)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusCreated)
+	})
+
+	r.Post("/cart", func(w http.ResponseWriter, r *http.Request) {
+		sessionID := "user-session-123"
+		var item CartItem
+		json.NewDecoder(r.Body).Decode(&item)
+		rdb.HIncrBy(ctx, "cart:"+sessionID, item.ProductID, int64(item.Quantity))
+		w.Write([]byte(`{"status": "added"}`))
+	})
+
+	r.Get("/cart", func(w http.ResponseWriter, r *http.Request) {
+		sessionID := "user-session-123"
+		cart, _ := rdb.HGetAll(ctx, "cart:"+sessionID).Result()
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(cart)
+	})
+
+	log.Println("Backend listening on port 8080...")
+	http.ListenAndServe(":8080", r)
+}
+GOMAIN
+
+cat << 'DOCKER' > backend/Dockerfile
+FROM golang:1.22-alpine AS builder
+WORKDIR /app
+COPY go.mod ./
+RUN go mod tidy
+COPY . .
+RUN CGO_ENABLED=0 GOOS=linux go build -o api ./cmd/api/main.go
+
+FROM alpine:latest
+WORKDIR /root/
+COPY --from=builder /app/api .
+EXPOSE 8080
+CMD ["./api"]
+DOCKER
+
+# --- Next.js Frontend ---
+cat << 'PKG' > frontend/package.json
+{
+  "name": "foodonmood-frontend",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start"
+  },
+  "dependencies": {
+    "next": "^14.2.3",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@types/node": "^20.12.12",
+    "@types/react": "^18.3.2",
+    "typescript": "^5.4.5"
+  }
+}
+PKG
+
+cat << 'NEXTCONF' > frontend/next.config.js
+/** @type {import('next').NextConfig} */
+const nextConfig = {
+  async rewrites() {
+    return [
+      {
+        source: '/api/:path*',
+        destination: 'http://backend:8080/:path*',
+      },
+    ]
+  },
+};
+
+module.exports = nextConfig;
+NEXTCONF
+
+cat << 'TSCONF' > frontend/tsconfig.json
+{
+  "compilerOptions": {
+    "target": "es5",
+    "lib": ["dom", "dom.iterable", "esnext"],
+    "allowJs": true,
+    "skipLibCheck": true,
+    "strict": true,
+    "noEmit": true,
+    "esModuleInterop": true,
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "jsx": "preserve",
+    "incremental": true,
+    "plugins": [{ "name": "next" }],
+    "paths": { "@/*": ["./src/*"] }
+  },
+  "include": ["next-env.d.ts", "**/*.ts", "**/*.tsx", ".next/types/**/*.ts"],
+  "exclude": ["node_modules"]
+}
+TSCONF
+
+cat << 'LAYOUT' > frontend/src/app/layout.tsx
+import React from "react";
+
+export const metadata = { title: "foodonmood" };
+
+export default function RootLayout({ children }: { children: React.ReactNode }) {
+  return (
+    <html lang="en">
+      <body style={{ margin: 0, padding: 0 }}>{children}</body>
+    </html>
+  );
+}
+LAYOUT
+
+cat << 'PAGE' > frontend/src/app/page.tsx
+"use client";
+
+import { useEffect, useState } from "react";
+
+export default function App() {
+  const [phone, setPhone] = useState("");
+  const [otp, setOtp] = useState("");
+  const [token, setToken] = useState<string | null>(null);
+  const [role, setRole] = useState("CUSTOMER");
+  const [otpSent, setOtpSent] = useState(false);
+
+  const [products, setProducts] = useState<any[]>([]);
+  const [cart, setCart] = useState<Record<string, string>>({});
+
+  // New Product Form (Admin)
+  const [sku, setSku] = useState("");
+  const [name, setName] = useState("");
+  const [price, setPrice] = useState(0);
+  const [unit, setUnit] = useState("portion");
+  const [deliveryTime, setDeliveryTime] = useState(30);
+
+  const fetchState = () => {
+    fetch("/api/products")
+      .then((res) => res.json())
+      .then((data) => setProducts(data || []));
+
+    fetch("/api/cart")
+      .then((res) => res.json())
+      .then((data) => setCart(data || {}));
+  };
+
+  useEffect(() => {
+    fetchState();
+  }, []);
+
+  const handleSendOtp = async () => {
+    await fetch("/api/auth/send-otp", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ phone_number: phone }),
+    });
+    setOtpSent(true);
+  };
+
+  const handleVerifyOtp = async () => {
+    const res = await fetch("/api/auth/verify-otp", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ phone_number: phone, otp }),
+    });
+    const data = await res.json();
+    if (res.ok) {
+      setToken(data.token);
+      setRole(data.role);
+    } else {
+      alert("Verification Failed");
+    }
+  };
+
+  const addToCart = async (sku: string) => {
+    await fetch("/api/cart", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ product_id: sku, quantity: 1 }),
+    });
+    fetchState();
+  };
+
+  const handleAddProduct = async () => {
+    await fetch("/api/admin/products", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        sku,
+        name,
+        description: "Freshly prepared",
+        price_cents: price * 100,
+        unit,
+        estimated_delivery_time: Number(deliveryTime),
+        stock_quantity: 100,
+      }),
+    });
+    alert("Item added!");
+    fetchState();
+  };
+
+  const cartTotalItems = Object.values(cart).reduce((a, b) => a + parseInt(b, 10), 0);
+
+  return (
+    <div style={{ padding: "40px", fontFamily: "sans-serif", maxWidth: "1000px", margin: "0 auto" }}>
+      <header style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "20px" }}>
+        <h1 style={{ color: "#ea580c", margin: 0 }}>🍲 foodonmood</h1>
+        <div style={{ fontWeight: "bold" }}>🛒 Cart: {cartTotalItems} items</div>
+      </header>
+
+      {!token ? (
+        <div style={{ border: "1px solid #ccc", padding: "20px", borderRadius: "8px", maxWidth: "400px" }}>
+          <h2>📱 Phone Authentication</h2>
+          {!otpSent ? (
+            <div>
+              <input placeholder="+1234567890 (Admin Phone)" value={phone} onChange={(e) => setPhone(e.target.value)} style={{ width: "100%", padding: "8px", marginBottom: "10px" }} />
+              <button onClick={handleSendOtp} style={{ width: "100%", padding: "10px", backgroundColor: "#ea580c", color: "#fff", border: "none" }}>Send OTP</button>
+            </div>
+          ) : (
+            <div>
+              <input placeholder="Enter OTP (Use 123456)" value={otp} onChange={(e) => setOtp(e.target.value)} style={{ width: "100%", padding: "8px", marginBottom: "10px" }} />
+              <button onClick={handleVerifyOtp} style={{ width: "100%", padding: "10px", backgroundColor: "#10b981", color: "#fff", border: "none" }}>Verify OTP</button>
+            </div>
+          )}
+        </div>
+      ) : (
+        <div>
+          <p>Logged in as: <strong>{phone}</strong> (Role: <span style={{ color: "#ea580c", fontWeight: "bold" }}>{role}</span>)</p>
+
+          {role === "ADMIN" && (
+            <div style={{ border: "2px solid #ea580c", padding: "20px", borderRadius: "8px", marginBottom: "20px" }}>
+              <h3>🛠 Admin Portal: Add Product</h3>
+              <input placeholder="SKU" onChange={(e) => setSku(e.target.value)} style={{ marginRight: "10px" }} />
+              <input placeholder="Name" onChange={(e) => setName(e.target.value)} style={{ marginRight: "10px" }} />
+              <input type="number" placeholder="Price ($)" onChange={(e) => setPrice(Number(e.target.value))} style={{ marginRight: "10px" }} />
+              <button onClick={handleAddProduct} style={{ padding: "8px 16px", backgroundColor: "#ea580c", color: "#fff", border: "none" }}>Add Item</button>
+            </div>
+          )}
+
+          <h2>🍽 Menu Catalog</h2>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))", gap: "20px" }}>
+            {products.map((p) => (
+              <div key={p.id} style={{ border: "1px solid #ccc", padding: "15px", borderRadius: "8px" }}>
+                <h3>{p.name}</h3>
+                <p>${(p.price_cents / 100).toFixed(2)} / {p.unit}</p>
+                <button onClick={() => addToCart(p.sku)} style={{ backgroundColor: "#ea580c", color: "#fff", border: "none", padding: "6px 12px" }}>Add to Cart</button>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+PAGE
+
+cat << 'FEDOCKER' > frontend/Dockerfile
+FROM node:20-alpine AS builder
+WORKDIR /app
+COPY package.json ./
+RUN npm install
+COPY . .
+RUN npm run build
+
+FROM node:20-alpine AS runner
+WORKDIR /app
+ENV NODE_ENV=production
+COPY --from=builder /app/package.json ./
+COPY --from=builder /app/node_modules ./node_modules
+COPY --from=builder /app/.next ./.next
+COPY --from=builder /app/next.config.js ./next.config.js
+
+EXPOSE 3000
+CMD ["npm", "run", "start"]
+FEDOCKER
+
+# --- Docker Compose ---
+cat << 'COMPOSE' > docker-compose.yml
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: foodonmood-db
+    environment:
+      POSTGRES_USER: fom_admin
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: fom_core
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./infrastructure/docker/schema.sql:/docker-entrypoint-initdb.d/schema.sql
+    networks:
+      - foodonmood_net
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: foodonmood-cache
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - foodonmood_net
+    restart: unless-stopped
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: foodonmood-api
+    environment:
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_USER: fom_admin
+      DB_PASSWORD: password
+      DB_NAME: fom_core
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      TWILIO_ACCOUNT_SID: ""
+      TWILIO_AUTH_TOKEN: ""
+      TWILIO_PHONE_NUMBER: ""
+    ports:
+      - "8080:8080"
+    depends_on:
+      - postgres
+      - redis
+    networks:
+      - foodonmood_net
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: foodonmood-ui
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend
+    networks:
+      - foodonmood_net
+    restart: unless-stopped
+
+networks:
+  foodonmood_net:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  redis_data:
+COMPOSE
+
+echo "=================================================="
+echo "⚡ 3. BUILDING & LAUNCHING CONTAINERS"
+echo "=================================================="
+
+docker compose down -v || true
+docker compose up --build -d
+
+echo ""
+echo "=================================================="
+echo "🎉 DEPLOYMENT COMPLETE!"
+echo "=================================================="
+echo "Storefront UI:   http://localhost:3000"
+echo "REST API:        http://localhost:8080"
+echo "Admin Phone:     +1234567890"
+echo "Test OTP:        123456"
+echo "=================================================="
+EOF
+
+chmod +x FoodOnMood.sh
+./FoodOnMood.sh
